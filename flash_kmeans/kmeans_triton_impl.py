@@ -163,11 +163,13 @@ def batch_kmeans_Euclid(
             sc_b, sc_k, sc_d = centroids_use.stride()
             scqu_b, scqu_k = c_sq_use.stride()
 
+            # Adaptive BK: smaller BK for small D (less reduction overhead)
+            bk = 64 if (D_use <= 32 and K > 1024) or K <= 1024 else 128
             _euclid_assign_kernel_tma[assign_grid](
                 x_use, centroids_use, x_sq_use, c_sq_use, out,
                 B, N, K, D_use, sxu_b, sxu_n, sxu_d, sc_b, sc_k, sc_d,
                 sxqu_b, sxqu_n, scqu_b, scqu_k, so_b, so_n,
-                BLOCK_N=128, BLOCK_K=assign_bk, num_warps=4, num_stages=1,
+                BLOCK_N=128, BLOCK_K=bk, num_warps=4, num_stages=1,
             )
 
             # Centroid update always uses FULL D
