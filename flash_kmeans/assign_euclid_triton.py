@@ -239,15 +239,11 @@ def _euclid_assign_kernel(
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    COMPUTE_CSQ: tl.constexpr = False,
 ):
-    """Each program handles a tile of BLOCK_N points for a given batch element.
-
-    The kernel iterates over the centroid dimension K in chunks of BLOCK_K and
-    maintains the running minimum distance as well as the corresponding index
-    for every point in the tile.
-    """
-    pid_n = tl.program_id(0)          # tile index along N dimension
-    pid_b = tl.program_id(1)          # batch index
+    """Each program handles a tile of BLOCK_N points for a given batch element."""
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -255,11 +251,7 @@ def _euclid_assign_kernel(
     n_offsets = n_offsets.to(tl.int64)
     n_mask = n_offsets < N
 
-    # ------------------------------------------------------------------
-    # Load x tile  (BLOCK_N, D)
-    # ------------------------------------------------------------------
     offs_d = tl.arange(0, D).to(tl.int64)
-    # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
         + pid_b * stride_x_b
@@ -267,25 +259,19 @@ def _euclid_assign_kernel(
         + offs_d[None, :] * stride_x_d
     )
     x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
-    x_tile = x_tile  # compute in f32
 
-    # Pre-load x_sq for the tile  (BLOCK_N,)
-    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+    if not COMPUTE_CSQ:
+        xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
+        x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
 
-    # Init best distance / index
-    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)  # large number
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
-    # ------------------------------------------------------------------
-    # Iterate over centroids in chunks of BLOCK_K
-    # ------------------------------------------------------------------
     for k_start in range(0, K, BLOCK_K):
         k_offsets = k_start + tl.arange(0, BLOCK_K)
         k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
-        # Load centroid tile  (D, BLOCK_K)
         c_ptrs = (
             c_ptr
             + pid_b * stride_c_b
@@ -293,23 +279,21 @@ def _euclid_assign_kernel(
             + offs_d[:, None] * stride_c_d
         )
         c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
-        c_tile = c_tile
 
-        # load c_sq for the tile  (BLOCK_K,)
-        csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
-        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        if COMPUTE_CSQ:
+            cent_sq = tl.sum(c_tile.to(tl.float32) * c_tile.to(tl.float32), axis=0)
+        else:
+            csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-        # # Compute centroid squared norms (BLOCK_K,)
-        # cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
 
-        # Compute cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
-        cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
+        if COMPUTE_CSQ:
+            dist = cent_sq[None, :] - 2.0 * cross
+        else:
+            dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+            dist = tl.maximum(dist, 0.0)
 
-        # Squared Euclidean distance
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.maximum(dist, 0.0)
-
-        # Mask out invalid centroid columns before reduction
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
 
         curr_min = tl.min(dist, axis=1)
@@ -319,9 +303,6 @@ def _euclid_assign_kernel(
         best_dist = tl.where(update, curr_min, best_dist)
         best_idx = tl.where(update, k_start + curr_idx, best_idx)
 
-    # ------------------------------------------------------------------
-    # Write results
-    # ------------------------------------------------------------------
     out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
 
