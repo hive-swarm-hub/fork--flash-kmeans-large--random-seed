@@ -337,7 +337,7 @@ def _euclid_assign_kernel_tma(
     n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
     n_mask = n_offsets < N
 
-    # TMA descriptor for this batch's centroids [K, D]
+    # TMA descriptor for centroids [K, D] - pipelined in the K-loop
     cent_desc = tl.make_tensor_descriptor(
         c_ptr + pid_b_i64 * stride_c_b,
         shape=[K, D],
@@ -345,14 +345,10 @@ def _euclid_assign_kernel_tma(
         block_shape=[BLOCK_K, D],
     )
 
-    # TMA descriptor for x [N, D] - loaded once, reused across K-chunks
-    x_desc = tl.make_tensor_descriptor(
-        x_ptr + pid_b_i64 * stride_x_b,
-        shape=[N, D],
-        strides=[stride_x_n, stride_x_d],
-        block_shape=[BLOCK_N, D],
-    )
-    x_tile = tl.load_tensor_descriptor(x_desc, [n_start, 0])
+    # Load x_tile via standard load (goes to registers, saves SMEM for TMA staging)
+    offs_d = tl.arange(0, D).to(tl.int64)
+    x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
 
     # Load x_sq
     xsq_ptrs = x_sq_ptr + pid_b_i64 * stride_xsq_b + n_offsets * stride_xsq_n
@@ -634,7 +630,6 @@ def euclid_assign_tma(
         c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
     centroids = centroids.contiguous()
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
-    # TMA optimal: wp=4 ns=1 (TMA handles async internally, extra stages waste SMEM)
     bk = 64 if K <= 1024 else 128
     _euclid_assign_kernel_tma[grid](
         x, centroids, x_sq, c_sq, out,
