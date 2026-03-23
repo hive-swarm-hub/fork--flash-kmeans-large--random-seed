@@ -137,7 +137,7 @@ def batch_kmeans_Euclid(
     torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
     finalize_grid = (B * K,)
 
-    # Pre-compute strides and grid for direct kernel call (skip wrapper overhead)
+    # Pre-compute strides and grid for direct kernel call
     assign_grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
     sx_b, sx_n, sx_d = x.stride()
     sxq_b, sxq_n = x_sq.stride()
@@ -146,7 +146,6 @@ def batch_kmeans_Euclid(
     assign_bk = 64 if K <= 1024 else 128
 
     for it in range(max_iters):
-        # Assignment: direct TMA kernel call (FA3-style, skip wrapper)
         sc_b, sc_k, sc_d = centroids.stride()
         _euclid_assign_kernel_tma[assign_grid](
             x, centroids, x_sq, c_sq, out,
