@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch.cuda import nvtx
 import triton
 import triton.language as tl
-from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton, _euclid_assign_kernel, _heuristic_euclid_config, euclid_assign_tma
+from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton, _euclid_assign_kernel, _heuristic_euclid_config, euclid_assign_tma, _euclid_assign_kernel_tma
 
 
 @triton.jit
@@ -137,9 +137,23 @@ def batch_kmeans_Euclid(
     torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
     finalize_grid = (B * K,)
 
+    # Pre-compute strides and grid for direct kernel call (skip wrapper overhead)
+    assign_grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    sx_b, sx_n, sx_d = x.stride()
+    sxq_b, sxq_n = x_sq.stride()
+    scq_b, scq_k = c_sq.stride()
+    so_b, so_n = out.stride()
+    assign_bk = 64 if K <= 1024 else 128
+
     for it in range(max_iters):
-        # Assignment: use TMA kernel for async loads (FA3-style)
-        euclid_assign_tma(x, centroids, x_sq, out=out, c_sq=c_sq)
+        # Assignment: direct TMA kernel call (FA3-style, skip wrapper)
+        sc_b, sc_k, sc_d = centroids.stride()
+        _euclid_assign_kernel_tma[assign_grid](
+            x, centroids.contiguous(), x_sq, c_sq, out,
+            B, N, K, D, sx_b, sx_n, sx_d, sc_b, sc_k, sc_d,
+            sxq_b, sxq_n, scq_b, scq_k, so_b, so_n,
+            BLOCK_N=128, BLOCK_K=assign_bk, num_warps=4, num_stages=1,
+        )
 
         # Centroid update
         if use_scatter:
