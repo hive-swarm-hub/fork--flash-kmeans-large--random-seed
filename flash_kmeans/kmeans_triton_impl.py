@@ -172,8 +172,8 @@ def batch_kmeans_Euclid(
         bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
 
         for it in range(n_iters):
-            centroids_use = centroids[:, :, :D_use].contiguous()
-            c_sq_use = (centroids_use.float() ** 2).sum(-1)
+            centroids_use = centroids[:, :, :D_use]
+            c_sq_use = (centroids_use.to(torch.float32).pow(2)).sum(-1)
             sc_b, sc_k, sc_d = centroids_use.stride()
             scqu_b, scqu_k = c_sq_use.stride()
             _euclid_assign_kernel_tma[assign_grid](
