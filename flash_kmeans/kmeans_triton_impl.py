@@ -148,14 +148,15 @@ def batch_kmeans_Euclid(
     else:
         phases.append((max_iters, D))
 
+    # Dummy x_sq (kernel doesn't use it — x_sq constant across K, irrelevant for argmin)
+    dummy_xsq = torch.empty((B, 1), device=x.device, dtype=torch.float32)
+
     for n_iters, D_use in phases:
         if n_iters <= 0:
             continue
 
         x_use = x[:, :, :D_use]
-        x_sq_use = (x_use ** 2).sum(dim=-1)
         sxu_b, sxu_n, sxu_d = x_use.stride()
-        sxqu_b, sxqu_n = x_sq_use.stride()
 
         for it in range(n_iters):
             centroids_use = centroids[:, :, :D_use].contiguous()
@@ -166,9 +167,9 @@ def batch_kmeans_Euclid(
             # Adaptive BK: smaller BK for small D (less reduction overhead)
             bk = 64 if (D_use <= 32 and K > 1024) or K <= 1024 else 128
             _euclid_assign_kernel_tma[assign_grid](
-                x_use, centroids_use, x_sq_use, c_sq_use, out,
+                x_use, centroids_use, dummy_xsq, c_sq_use, out,
                 B, N, K, D_use, sxu_b, sxu_n, sxu_d, sc_b, sc_k, sc_d,
-                sxqu_b, sxqu_n, scqu_b, scqu_k, so_b, so_n,
+                0, 0, scqu_b, scqu_k, so_b, so_n,
                 BLOCK_N=128, BLOCK_K=bk, num_warps=4, num_stages=1,
             )
 

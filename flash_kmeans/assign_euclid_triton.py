@@ -318,6 +318,12 @@ _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])
 
 
 @triton.jit
+def _min_argmin_combine(val_a, idx_a, val_b, idx_b):
+    use_b = val_b < val_a
+    return tl.where(use_b, val_b, val_a), tl.where(use_b, idx_b, idx_a)
+
+
+@triton.jit
 def _euclid_assign_kernel_tma(
     x_ptr, c_ptr, x_sq_ptr, c_sq_ptr, out_ptr,
     B: tl.constexpr, N: tl.constexpr, K: tl.constexpr, D: tl.constexpr,
@@ -362,11 +368,13 @@ def _euclid_assign_kernel_tma(
         cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
         dist = cent_sq[None, :] - 2.0 * cross
-        curr_min = tl.min(dist, axis=1)
-        curr_idx = tl.argmin(dist, axis=1)
+        # Fused min+argmin: single reduction pass instead of two
+        _k_idx = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
+        curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx, dist.shape)),
+                                        axis=1, combine_fn=_min_argmin_combine)
         update = curr_min < best_dist
         best_dist = tl.where(update, curr_min, best_dist)
-        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+        best_idx = tl.where(update, curr_idx, best_idx)
 
     if k_remainder > 0:
         k_start = k_full
@@ -378,11 +386,12 @@ def _euclid_assign_kernel_tma(
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
         dist = cent_sq[None, :] - 2.0 * cross
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
-        curr_min = tl.min(dist, axis=1)
-        curr_idx = tl.argmin(dist, axis=1)
+        _k_idx2 = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
+        curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx2, dist.shape)),
+                                        axis=1, combine_fn=_min_argmin_combine)
         update = curr_min < best_dist
         best_dist = tl.where(update, curr_min, best_dist)
-        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+        best_idx = tl.where(update, curr_idx, best_idx)
 
     out_ptrs = out_ptr + pid_b_i64 * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
