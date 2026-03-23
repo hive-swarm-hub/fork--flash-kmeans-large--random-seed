@@ -2,7 +2,37 @@ import torch
 import torch.nn.functional as F
 from torch.cuda import nvtx
 import triton
+import triton.language as tl
 from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton, _euclid_assign_kernel, _heuristic_euclid_config
+
+
+@triton.jit
+def _finalize_csq_kernel(
+    sums_ptr, counts_ptr, old_ptr, new_ptr, csq_ptr,
+    K: tl.constexpr, D: tl.constexpr,
+):
+    """Fused centroid finalization + c_sq computation. One program per (b, k)."""
+    pid = tl.program_id(0)
+    bk = pid.to(tl.int64)
+
+    count = tl.load(counts_ptr + bk)
+    inv_count = 1.0 / tl.maximum(count, 1.0)
+    is_empty = count < 0.5
+
+    offs_d = tl.arange(0, D).to(tl.int64)
+    base = bk * D + offs_d
+
+    s_vals = tl.load(sums_ptr + base)
+    o_vals = tl.load(old_ptr + base).to(tl.float32)
+
+    new_f32 = tl.where(is_empty, o_vals, s_vals * inv_count)
+    new_f16 = new_f32.to(tl.float16)
+    tl.store(new_ptr + base, new_f16)
+
+    # c_sq from the fp16 representation
+    nf = new_f16.to(tl.float32)
+    csq = tl.sum(nf * nf)
+    tl.store(csq_ptr + bk, csq)
 from flash_kmeans.centroid_update_triton import (
     triton_centroid_update_cosine,
     triton_centroid_update_euclid,
@@ -90,6 +120,8 @@ def batch_kmeans_Euclid(
     out = torch.empty((B, N), device=x.device, dtype=torch.int32)
     cent_sums = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
     cent_cnts = torch.zeros((B, K), device=x.device, dtype=torch.float32)
+    c_sq = torch.empty((B, K), device=x.device, dtype=torch.float32)
+    centroids_new = torch.empty_like(centroids)
     no_tol = tol < 0
 
     # scatter_add centroid update: pre-compute x in fp32 once
@@ -100,9 +132,12 @@ def batch_kmeans_Euclid(
         ids_exp = ids_long.unsqueeze(-1).expand(-1, -1, D)
         ones_f = torch.ones((B, N), device=x.device, dtype=torch.float32)
 
+    # Initial c_sq
+    torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
+    finalize_grid = (B * K,)
+
     for it in range(max_iters):
-        # Compute c_sq and run assignment
-        c_sq = (centroids.float() ** 2).sum(-1)
+        # Assignment (c_sq already computed)
         euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq, use_heuristic=use_heuristic)
 
         # Centroid update
@@ -112,9 +147,12 @@ def batch_kmeans_Euclid(
             cent_sums.scatter_add_(1, ids_exp, x_f32)
             cent_cnts.zero_()
             cent_cnts.scatter_add_(1, ids_long, ones_f)
-            empty = (cent_cnts < 0.5).unsqueeze(-1)
-            counts = cent_cnts.unsqueeze(-1).clamp(min=1.0)
-            centroids = torch.where(empty, centroids.float(), cent_sums / counts).to(x.dtype)
+            # Fused finalization + c_sq for next iteration
+            _finalize_csq_kernel[finalize_grid](
+                cent_sums, cent_cnts, centroids, centroids_new, c_sq,
+                K, D, num_warps=4,
+            )
+            centroids = centroids_new
         else:
             centroids_new = triton_centroid_update_sorted_euclid(x, out, centroids)
             if not no_tol:
@@ -124,6 +162,7 @@ def batch_kmeans_Euclid(
                 if shift < tol:
                     break
             centroids = centroids_new
+            torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
 
     return out, centroids, it + 1
 
