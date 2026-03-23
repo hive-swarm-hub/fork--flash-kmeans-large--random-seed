@@ -136,11 +136,14 @@ def batch_kmeans_Euclid(
     assign_bk = 64 if K <= 1024 else 128
 
     # --- Dimension reduction: use D_low for early iters, full D for final ---
-    D_low = D // 2 if D >= 128 and max_iters > 2 else D
-    n_cheap = max_iters - 2 if D_low < D else 0
-    n_full = max_iters - n_cheap
+    D_low = D // 2 if D >= 64 else D
+    n_full = 1
+    n_cheap = max_iters - n_full if D_low < D else 0
+    if n_cheap <= 0:
+        n_cheap = 0
+        n_full = max_iters
 
-    # Low-D views (slicing first D_low dims — contiguous in last dim, just shorter)
+    # Low-D views
     x_low = x[:, :, :D_low]
     x_sq_low = (x_low ** 2).sum(dim=-1)
 
