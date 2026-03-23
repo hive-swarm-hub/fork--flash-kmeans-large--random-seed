@@ -169,7 +169,7 @@ def batch_kmeans_Euclid(
         x_use = x[:, :, :D_use]
         sxu_b, sxu_n, sxu_d = x_use.stride()
 
-        bk = 64 if (D_use <= 32 and K > 1024) or K <= 1024 else 128
+        bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
 
         for it in range(n_iters):
             centroids_use = centroids[:, :, :D_use].contiguous()
