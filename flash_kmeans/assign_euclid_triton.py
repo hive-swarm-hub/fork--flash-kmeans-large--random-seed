@@ -337,15 +337,13 @@ def _euclid_assign_kernel_tma(
     n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
     n_mask = n_offsets < N
 
-    # TMA descriptor for centroids [K, D] - pipelined in the K-loop
+    # TMA descriptor for centroids - Triton handles pingpong via num_stages
     cent_desc = tl.make_tensor_descriptor(
         c_ptr + pid_b_i64 * stride_c_b,
-        shape=[K, D],
-        strides=[stride_c_k, stride_c_d],
-        block_shape=[BLOCK_K, D],
+        shape=[K, D], strides=[stride_c_k, stride_c_d], block_shape=[BLOCK_K, D],
     )
 
-    # Load x_tile via standard load (goes to registers, saves SMEM for TMA staging)
+    # Load x_tile via standard load (registers, saves SMEM for TMA staging)
     offs_d = tl.arange(0, D).to(tl.int64)
     x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
     x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
@@ -357,13 +355,13 @@ def _euclid_assign_kernel_tma(
     best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
-    # Process K in chunks. K%BLOCK_K==0 can skip masking for large-K workloads
     k_remainder = K % BLOCK_K
     k_full = K - k_remainder
+    csq_base = c_sq_ptr + pid_b_i64 * stride_csq_b
 
     for k_start in range(0, k_full, BLOCK_K):
         c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
-        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
+        csq_ptrs = csq_base + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
         cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
         dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
@@ -373,13 +371,12 @@ def _euclid_assign_kernel_tma(
         best_dist = tl.where(update, curr_min, best_dist)
         best_idx = tl.where(update, k_start + curr_idx, best_idx)
 
-    # Handle remainder (if K not divisible by BLOCK_K)
     if k_remainder > 0:
         k_start = k_full
         k_offsets = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offsets < K
         c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
-        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + k_offsets.to(tl.int64) * stride_csq_k
+        csq_ptrs = csq_base + k_offsets.to(tl.int64) * stride_csq_k
         cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
         dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
