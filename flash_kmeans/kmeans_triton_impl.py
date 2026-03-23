@@ -171,9 +171,15 @@ def batch_kmeans_Euclid(
         bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
 
         # For cheap D/4 iterations: update centroids every 2 iters to save scatter_add cost
-        update_every = 7 if D_use <= D // 4 and D_use < D else 1
+        # For D/4 phase: centroids don't change between updates, so only need
+        # to assign ONCE before each update. Skip redundant assign calls.
+        skip_redundant = D_use <= D // 4 and D_use < D
 
         for it in range(n_iters):
+            # Skip redundant assigns when centroids haven't changed since last assign
+            if skip_redundant and it > 0 and it < n_iters - 1:
+                continue  # skip both assign and update — result unchanged
+
             centroids_use = centroids[:, :, :D_use]
             c_sq_use = (centroids_use.to(torch.float32).pow(2)).sum(-1)
             sc_b, sc_k, sc_d = centroids_use.stride()
@@ -185,10 +191,6 @@ def batch_kmeans_Euclid(
                 BLOCK_N=128, BLOCK_K=bk, SKIP_CSQ=False,
                 num_warps=4, num_stages=1,
             )
-
-            # Skip centroid update on odd iterations for cheap phases
-            if update_every > 1 and it % update_every != update_every - 1 and it < n_iters - 1:
-                continue
 
             # Centroid update always uses FULL D
             if use_scatter:
