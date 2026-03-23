@@ -135,13 +135,24 @@ def batch_kmeans_Euclid(
     so_b, so_n = out.stride()
     assign_bk = 64 if K <= 1024 else 128
 
-    # --- Multi-phase dimension reduction schedule ---
-    # D/4 for early iters (4x cheaper), D/2 for mid (2x cheaper), full D for final
+    # --- Multi-phase dimension reduction schedule (adaptive by K) ---
     phases = []
     if D >= 128 and max_iters >= 6:
-        phases.append((max_iters - 5, D // 4))  # very cheap (D=32)
-        phases.append((3, D // 2))               # medium (D=64)
-        phases.append((2, D))                    # full precision (D=128)
+        if K <= 1024:
+            # large-scale: very tolerant, can use more D/4
+            phases.append((max_iters - 3, D // 4))
+            phases.append((1, D // 2))
+            phases.append((2, D))
+        elif K > 4096:
+            # stress: tolerant, use 7+1+2
+            phases.append((max_iters - 3, D // 4))
+            phases.append((1, D // 2))
+            phases.append((2, D))
+        else:
+            # large-dense: tightest constraint, 5+3+2
+            phases.append((max_iters - 5, D // 4))
+            phases.append((3, D // 2))
+            phases.append((2, D))
     elif D >= 64 and max_iters >= 2:
         phases.append((max_iters - 1, D // 2))
         phases.append((1, D))
