@@ -624,8 +624,9 @@ def euclid_assign_tma(
     if c_sq is None:
         c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
     centroids = centroids.contiguous()
-    config = _heuristic_euclid_config(N, K, D, device=x.device)
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    # TMA optimal: wp=4 ns=1 (TMA handles async internally, extra stages waste SMEM)
+    bk = 64 if K <= 1024 else 128
     _euclid_assign_kernel_tma[grid](
         x, centroids, x_sq, c_sq, out,
         B, N, K, D,
@@ -634,8 +635,8 @@ def euclid_assign_tma(
         x_sq.stride(0), x_sq.stride(1),
         c_sq.stride(0), c_sq.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_N=config["BLOCK_N"], BLOCK_K=config["BLOCK_K"],
-        num_warps=config["num_warps"], num_stages=config["num_stages"],
+        BLOCK_N=128, BLOCK_K=bk,
+        num_warps=4, num_stages=1,
     )
     return out
 
