@@ -3,6 +3,14 @@ import torch
 import triton
 import triton.language as tl
 
+# Set Triton allocator for TMA support
+def _triton_alloc(size, alignment, stream):
+    return torch.empty(size, dtype=torch.uint8, device="cuda")
+try:
+    triton.set_allocator(_triton_alloc)
+except Exception:
+    pass
+
 # ===============================================================
 # Triton kernel: compute nearest-centroid IDs (Euclidean distance)
 # Inputs:
@@ -308,6 +316,75 @@ def _euclid_assign_kernel(
 
 _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_euclid_assign_kernel)
 
+
+@triton.jit
+def _euclid_assign_kernel_tma(
+    x_ptr, c_ptr, x_sq_ptr, c_sq_ptr, out_ptr,
+    B: tl.constexpr, N: tl.constexpr, K: tl.constexpr, D: tl.constexpr,
+    stride_x_b: tl.constexpr, stride_x_n: tl.constexpr, stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr, stride_c_k: tl.constexpr, stride_c_d: tl.constexpr,
+    stride_xsq_b: tl.constexpr, stride_xsq_n: tl.constexpr,
+    stride_csq_b: tl.constexpr, stride_csq_k: tl.constexpr,
+    stride_out_b: tl.constexpr, stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """FA3-style assignment kernel using TMA for async centroid loads."""
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_b_i64 = pid_b.to(tl.int64)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
+    n_mask = n_offsets < N
+
+    # TMA descriptor for this batch's centroids [K, D]
+    cent_desc = tl.make_tensor_descriptor(
+        c_ptr + pid_b_i64 * stride_c_b,
+        shape=[K, D],
+        strides=[stride_c_k, stride_c_d],
+        block_shape=[BLOCK_K, D],
+    )
+
+    # Load x_tile via standard load (reused across K-chunks, keep in cache)
+    offs_d = tl.arange(0, D).to(tl.int64)
+    x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
+
+    # Load x_sq
+    xsq_ptrs = x_sq_ptr + pid_b_i64 * stride_xsq_b + n_offsets * stride_xsq_n
+    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
+
+        # Load c_tile via TMA (async, hardware-managed)
+        c_tile_raw = tl.load_tensor_descriptor(cent_desc, [k_start, 0])  # [BLOCK_K, D]
+        c_tile = tl.trans(c_tile_raw)  # [D, BLOCK_K] for dot product
+
+        # Load c_sq (small, standard load)
+        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + k_offsets.to(tl.int64) * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
+
+        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+
+        curr_min = tl.min(dist, axis=1)
+        curr_idx = tl.argmin(dist, axis=1)
+
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    out_ptrs = out_ptr + pid_b_i64 * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
+
 @triton.jit
 def _cosine_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
@@ -528,6 +605,34 @@ def euclid_assign_triton(
             stride_out_b,
             stride_out_n,
         )
+    return out
+
+
+def euclid_assign_tma(
+    x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.Tensor,
+    out: torch.Tensor = None, c_sq: torch.Tensor = None,
+) -> torch.Tensor:
+    """Assignment using TMA async loads (FA3-style)."""
+    B, N, D = x.shape
+    K = centroids.shape[1]
+    if out is None:
+        out = torch.empty((B, N), device=x.device, dtype=torch.int32)
+    if c_sq is None:
+        c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
+    centroids = centroids.contiguous()
+    config = _heuristic_euclid_config(N, K, D, device=x.device)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    _euclid_assign_kernel_tma[grid](
+        x, centroids, x_sq, c_sq, out,
+        B, N, K, D,
+        x.stride(0), x.stride(1), x.stride(2),
+        centroids.stride(0), centroids.stride(1), centroids.stride(2),
+        x_sq.stride(0), x_sq.stride(1),
+        c_sq.stride(0), c_sq.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_N=config["BLOCK_N"], BLOCK_K=config["BLOCK_K"],
+        num_warps=config["num_warps"], num_stages=config["num_stages"],
+    )
     return out
 
 

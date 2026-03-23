@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch.cuda import nvtx
 import triton
 import triton.language as tl
-from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton, _euclid_assign_kernel, _heuristic_euclid_config
+from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assign_triton, _euclid_assign_kernel, _heuristic_euclid_config, euclid_assign_tma
 
 
 @triton.jit
@@ -138,8 +138,8 @@ def batch_kmeans_Euclid(
     finalize_grid = (B * K,)
 
     for it in range(max_iters):
-        # Assignment (c_sq already computed)
-        euclid_assign_triton(x, centroids, x_sq, out=out, c_sq=c_sq, use_heuristic=use_heuristic)
+        # Assignment: use TMA kernel for async loads (FA3-style)
+        euclid_assign_tma(x, centroids, x_sq, out=out, c_sq=c_sq)
 
         # Centroid update
         if use_scatter:
