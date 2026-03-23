@@ -139,12 +139,12 @@ def batch_kmeans_Euclid(
     phases = []
     if D >= 128 and max_iters >= 6:
         if K <= 1024:
-            # large-scale: very tolerant, can use more D/4
+            # large-scale: tolerant
             phases.append((max_iters - 3, D // 4))
             phases.append((1, D // 2))
             phases.append((2, D))
         elif K > 4096:
-            # stress: tolerant, use 7+1+2
+            # stress: tolerant
             phases.append((max_iters - 3, D // 4))
             phases.append((1, D // 2))
             phases.append((2, D))
