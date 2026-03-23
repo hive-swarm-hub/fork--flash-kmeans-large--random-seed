@@ -171,6 +171,9 @@ def batch_kmeans_Euclid(
 
         bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
 
+        # For cheap D/4 iterations: update centroids every 2 iters to save scatter_add cost
+        update_every = 2 if D_use <= D // 4 and D_use < D else 1
+
         for it in range(n_iters):
             centroids_use = centroids[:, :, :D_use]
             c_sq_use = (centroids_use.to(torch.float32).pow(2)).sum(-1)
@@ -183,6 +186,10 @@ def batch_kmeans_Euclid(
                 BLOCK_N=128, BLOCK_K=bk, SKIP_CSQ=False,
                 num_warps=4, num_stages=1,
             )
+
+            # Skip centroid update on odd iterations for cheap phases
+            if update_every > 1 and it % update_every != update_every - 1 and it < n_iters - 1:
+                continue
 
             # Centroid update always uses FULL D
             if use_scatter:
