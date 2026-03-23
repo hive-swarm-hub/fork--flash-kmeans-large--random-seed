@@ -172,7 +172,7 @@ def batch_kmeans_Euclid(
         bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
 
         # For cheap D/4 iterations: update centroids every 2 iters to save scatter_add cost
-        update_every = 2 if D_use <= D // 4 and D_use < D else 1
+        update_every = 7 if D_use <= D // 4 and D_use < D else 1
 
         for it in range(n_iters):
             centroids_use = centroids[:, :, :D_use]
