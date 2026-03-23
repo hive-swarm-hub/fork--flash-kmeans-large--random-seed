@@ -361,26 +361,35 @@ def _euclid_assign_kernel_tma(
     best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
-    for k_start in range(0, K, BLOCK_K):
-        k_offsets = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offsets < K
+    # Process K in chunks. K%BLOCK_K==0 can skip masking for large-K workloads
+    k_remainder = K % BLOCK_K
+    k_full = K - k_remainder
 
-        # Load c_tile via TMA (async, hardware-managed)
-        c_tile_raw = tl.load_tensor_descriptor(cent_desc, [k_start, 0])  # [BLOCK_K, D]
-        c_tile = tl.trans(c_tile_raw)  # [D, BLOCK_K] for dot product
-
-        # Load c_sq (small, standard load)
-        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + k_offsets.to(tl.int64) * stride_csq_k
-        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
-
-        cross = tl.dot(x_tile, c_tile).to(tl.float32)
-
+    for k_start in range(0, k_full, BLOCK_K):
+        c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
+        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
+        cross = tl.dot(x_tile, c_tile, input_precision="ieee")
         dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.where(k_mask[None, :], dist, 3.4e38)
-
         curr_min = tl.min(dist, axis=1)
         curr_idx = tl.argmin(dist, axis=1)
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
 
+    # Handle remainder (if K not divisible by BLOCK_K)
+    if k_remainder > 0:
+        k_start = k_full
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
+        c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
+        csq_ptrs = c_sq_ptr + pid_b_i64 * stride_csq_b + k_offsets.to(tl.int64) * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+        cross = tl.dot(x_tile, c_tile, input_precision="ieee")
+        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+        curr_min = tl.min(dist, axis=1)
+        curr_idx = tl.argmin(dist, axis=1)
         update = curr_min < best_dist
         best_dist = tl.where(update, curr_min, best_dist)
         best_idx = tl.where(update, k_start + curr_idx, best_idx)
