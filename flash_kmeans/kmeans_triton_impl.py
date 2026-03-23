@@ -182,7 +182,7 @@ def batch_kmeans_Euclid(
     return out, centroids, it + 1
 
 try:
-    batch_kmeans_Euclid = torch.compile(batch_kmeans_Euclid, mode="reduce-overhead", fullgraph=False)
+    batch_kmeans_Euclid = torch.compile(batch_kmeans_Euclid, mode="reduce-overhead", fullgraph=False, dynamic=False)
 except Exception:
     pass
 
