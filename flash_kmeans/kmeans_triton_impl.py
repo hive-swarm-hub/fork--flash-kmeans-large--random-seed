@@ -120,6 +120,7 @@ def batch_kmeans_Euclid(
     out = torch.empty((B, N), device=x.device, dtype=torch.int32)
     cent_sums = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
     cent_cnts = torch.zeros((B, K), device=x.device, dtype=torch.float32)
+    cent_cnts_i32 = torch.zeros((B, K), device=x.device, dtype=torch.int32)
     c_sq = torch.empty((B, K), device=x.device, dtype=torch.float32)
     centroids_new = torch.empty_like(centroids)
     no_tol = tol < 0
@@ -147,22 +148,22 @@ def batch_kmeans_Euclid(
             cent_sums.scatter_add_(1, ids_exp, x_f32)
             cent_cnts.zero_()
             cent_cnts.scatter_add_(1, ids_long, ones_f)
-            # Fused finalization + c_sq for next iteration
-            _finalize_csq_kernel[finalize_grid](
-                cent_sums, cent_cnts, centroids, centroids_new, c_sq,
-                K, D, num_warps=4,
-            )
-            centroids = centroids_new
         else:
-            centroids_new = triton_centroid_update_sorted_euclid(x, out, centroids)
-            if not no_tol:
-                shift = (centroids_new - centroids).norm(dim=-1).max()
-                if verbose:
-                    print(f"Iter {it}, center shift: {shift.item():.6f}")
-                if shift < tol:
-                    break
-            centroids = centroids_new
-            torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
+            cent_sums.zero_()
+            cent_cnts_i32.zero_()
+            triton_centroid_update_sorted_euclid(
+                x, out, centroids,
+                centroid_sums=cent_sums, centroid_cnts=cent_cnts_i32,
+                calculate_new=False,
+            )
+            cent_cnts.copy_(cent_cnts_i32)
+
+        # Fused finalization + c_sq for next iteration (both paths)
+        _finalize_csq_kernel[finalize_grid](
+            cent_sums, cent_cnts, centroids, centroids_new, c_sq,
+            K, D, num_warps=4,
+        )
+        centroids = centroids_new
 
     return out, centroids, it + 1
 
