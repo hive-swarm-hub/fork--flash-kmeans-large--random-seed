@@ -149,7 +149,7 @@ def batch_kmeans_Euclid(
         # Assignment: direct TMA kernel call (FA3-style, skip wrapper)
         sc_b, sc_k, sc_d = centroids.stride()
         _euclid_assign_kernel_tma[assign_grid](
-            x, centroids.contiguous(), x_sq, c_sq, out,
+            x, centroids, x_sq, c_sq, out,
             B, N, K, D, sx_b, sx_n, sx_d, sc_b, sc_k, sc_d,
             sxq_b, sxq_n, scq_b, scq_k, so_b, so_n,
             BLOCK_N=128, BLOCK_K=assign_bk, num_warps=4, num_stages=1,
