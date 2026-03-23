@@ -181,6 +181,11 @@ def batch_kmeans_Euclid(
 
     return out, centroids, it + 1
 
+try:
+    batch_kmeans_Euclid = torch.compile(batch_kmeans_Euclid, mode="reduce-overhead", fullgraph=False)
+except Exception:
+    pass
+
 
 def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
     """
