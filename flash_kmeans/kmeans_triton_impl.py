@@ -105,8 +105,6 @@ def batch_kmeans_Euclid(
     B, N, D = x.shape
     K = n_clusters
 
-    x_sq = (x ** 2).sum(dim=-1)  # (B, N)
-
     if init_centroids is None:
         indices = torch.randint(0, N, (B, K), device=x.device)
         centroids = torch.gather(
@@ -123,7 +121,6 @@ def batch_kmeans_Euclid(
     cent_cnts_i32 = torch.zeros((B, K), device=x.device, dtype=torch.int32)
     c_sq = torch.empty((B, K), device=x.device, dtype=torch.float32)
     centroids_new = torch.empty_like(centroids)
-    no_tol = tol < 0
 
     # scatter_add centroid update: pre-compute x in fp32 once
     use_scatter = N // max(K, 1) < 64
@@ -133,28 +130,37 @@ def batch_kmeans_Euclid(
         ids_exp = ids_long.unsqueeze(-1).expand(-1, -1, D)
         ones_f = torch.ones((B, N), device=x.device, dtype=torch.float32)
 
-    # Initial c_sq
-    torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
     finalize_grid = (B * K,)
-
-    # Pre-compute strides and grid for direct kernel call
     assign_grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
-    sx_b, sx_n, sx_d = x.stride()
-    sxq_b, sxq_n = x_sq.stride()
-    scq_b, scq_k = c_sq.stride()
     so_b, so_n = out.stride()
     assign_bk = 64 if K <= 1024 else 128
 
-    for it in range(max_iters):
-        sc_b, sc_k, sc_d = centroids.stride()
+    # --- Dimension reduction: use D_low for early iters, full D for final ---
+    D_low = D // 2 if D >= 128 and max_iters > 2 else D
+    n_cheap = max_iters - 2 if D_low < D else 0
+    n_full = max_iters - n_cheap
+
+    # Low-D views (slicing first D_low dims — contiguous in last dim, just shorter)
+    x_low = x[:, :, :D_low]
+    x_sq_low = (x_low ** 2).sum(dim=-1)
+
+    # --- Phase 1: cheap iterations with D_low assignment ---
+    for it in range(n_cheap):
+        centroids_low = centroids[:, :, :D_low].contiguous()
+        c_sq_low = (centroids_low.float() ** 2).sum(-1)
+        sc_b, sc_k, sc_d = centroids_low.stride()
+        sxl_b, sxl_n, sxl_d = x_low.stride()
+        sxql_b, sxql_n = x_sq_low.stride()
+        scql_b, scql_k = c_sq_low.stride()
+
         _euclid_assign_kernel_tma[assign_grid](
-            x, centroids, x_sq, c_sq, out,
-            B, N, K, D, sx_b, sx_n, sx_d, sc_b, sc_k, sc_d,
-            sxq_b, sxq_n, scq_b, scq_k, so_b, so_n,
+            x_low, centroids_low, x_sq_low, c_sq_low, out,
+            B, N, K, D_low, sxl_b, sxl_n, sxl_d, sc_b, sc_k, sc_d,
+            sxql_b, sxql_n, scql_b, scql_k, so_b, so_n,
             BLOCK_N=128, BLOCK_K=assign_bk, num_warps=4, num_stages=1,
         )
 
-        # Centroid update
+        # Centroid update uses FULL D (accurate centroids)
         if use_scatter:
             ids_long.copy_(out)
             cent_sums.zero_()
@@ -171,14 +177,51 @@ def batch_kmeans_Euclid(
             )
             cent_cnts.copy_(cent_cnts_i32)
 
-        # Fused finalization + c_sq for next iteration (both paths)
         _finalize_csq_kernel[finalize_grid](
             cent_sums, cent_cnts, centroids, centroids_new, c_sq,
             K, D, num_warps=4,
         )
         centroids = centroids_new
 
-    return out, centroids, it + 1
+    # --- Phase 2: full-D iterations for final precision ---
+    x_sq = (x ** 2).sum(dim=-1)
+    torch.sum(centroids.float() ** 2, dim=-1, out=c_sq)
+    sx_b, sx_n, sx_d = x.stride()
+    sxq_b, sxq_n = x_sq.stride()
+    scq_b, scq_k = c_sq.stride()
+
+    for it in range(n_full):
+        sc_b, sc_k, sc_d = centroids.stride()
+        _euclid_assign_kernel_tma[assign_grid](
+            x, centroids, x_sq, c_sq, out,
+            B, N, K, D, sx_b, sx_n, sx_d, sc_b, sc_k, sc_d,
+            sxq_b, sxq_n, scq_b, scq_k, so_b, so_n,
+            BLOCK_N=128, BLOCK_K=assign_bk, num_warps=4, num_stages=1,
+        )
+
+        if use_scatter:
+            ids_long.copy_(out)
+            cent_sums.zero_()
+            cent_sums.scatter_add_(1, ids_exp, x_f32)
+            cent_cnts.zero_()
+            cent_cnts.scatter_add_(1, ids_long, ones_f)
+        else:
+            cent_sums.zero_()
+            cent_cnts_i32.zero_()
+            triton_centroid_update_sorted_euclid(
+                x, out, centroids,
+                centroid_sums=cent_sums, centroid_cnts=cent_cnts_i32,
+                calculate_new=False,
+            )
+            cent_cnts.copy_(cent_cnts_i32)
+
+        _finalize_csq_kernel[finalize_grid](
+            cent_sums, cent_cnts, centroids, centroids_new, c_sq,
+            K, D, num_warps=4,
+        )
+        centroids = centroids_new
+
+    return out, centroids, max_iters
 
 try:
     batch_kmeans_Euclid = torch.compile(batch_kmeans_Euclid, mode="reduce-overhead", fullgraph=False)
