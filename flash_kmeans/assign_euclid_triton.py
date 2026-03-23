@@ -258,7 +258,7 @@ def _euclid_assign_kernel(
         + n_offsets[:, None] * stride_x_n
         + offs_d[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
 
     if not COMPUTE_CSQ:
         xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
@@ -278,7 +278,7 @@ def _euclid_assign_kernel(
             + k_offsets[None, :] * stride_c_k
             + offs_d[:, None] * stride_c_d
         )
-        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0, eviction_policy="evict_first")
 
         if COMPUTE_CSQ:
             cent_sq = tl.sum(c_tile.to(tl.float32) * c_tile.to(tl.float32), axis=0)
