@@ -345,10 +345,14 @@ def _euclid_assign_kernel_tma(
         block_shape=[BLOCK_K, D],
     )
 
-    # Load x_tile via standard load (reused across K-chunks, keep in cache)
-    offs_d = tl.arange(0, D).to(tl.int64)
-    x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
-    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
+    # TMA descriptor for x [N, D] - loaded once, reused across K-chunks
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr + pid_b_i64 * stride_x_b,
+        shape=[N, D],
+        strides=[stride_x_n, stride_x_d],
+        block_shape=[BLOCK_N, D],
+    )
+    x_tile = tl.load_tensor_descriptor(x_desc, [n_start, 0])
 
     # Load x_sq
     xsq_ptrs = x_sq_ptr + pid_b_i64 * stride_xsq_b + n_offsets * stride_xsq_n
