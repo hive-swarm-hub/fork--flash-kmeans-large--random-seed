@@ -348,10 +348,7 @@ def _euclid_assign_kernel_tma(
     x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
     x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
 
-    # Load x_sq
-    xsq_ptrs = x_sq_ptr + pid_b_i64 * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
-
+    # x_sq not needed — constant across K, doesn't affect argmin
     best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
@@ -364,7 +361,7 @@ def _euclid_assign_kernel_tma(
         csq_ptrs = csq_base + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
         cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = cent_sq[None, :] - 2.0 * cross
         curr_min = tl.min(dist, axis=1)
         curr_idx = tl.argmin(dist, axis=1)
         update = curr_min < best_dist
@@ -379,7 +376,7 @@ def _euclid_assign_kernel_tma(
         csq_ptrs = csq_base + k_offsets.to(tl.int64) * stride_csq_k
         cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = cent_sq[None, :] - 2.0 * cross
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
         curr_min = tl.min(dist, axis=1)
         curr_idx = tl.argmin(dist, axis=1)
