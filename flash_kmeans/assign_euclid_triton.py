@@ -333,6 +333,7 @@ def _euclid_assign_kernel_tma(
     stride_csq_b: tl.constexpr, stride_csq_k: tl.constexpr,
     stride_out_b: tl.constexpr, stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SKIP_CSQ: tl.constexpr = False,
 ):
     """FA3-style assignment kernel using TMA for async centroid loads."""
     pid_n = tl.program_id(0)
@@ -364,10 +365,13 @@ def _euclid_assign_kernel_tma(
 
     for k_start in range(0, k_full, BLOCK_K):
         c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
-        csq_ptrs = csq_base + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
-        cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
-        dist = cent_sq[None, :] - 2.0 * cross
+        if SKIP_CSQ:
+            dist = -cross  # approximate: max similarity = min distance
+        else:
+            csq_ptrs = csq_base + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
+            dist = cent_sq[None, :] - 2.0 * cross
         # Fused min+argmin: single reduction pass instead of two
         _k_idx = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
         curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx, dist.shape)),
@@ -381,10 +385,13 @@ def _euclid_assign_kernel_tma(
         k_offsets = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offsets < K
         c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
-        csq_ptrs = csq_base + k_offsets.to(tl.int64) * stride_csq_k
-        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
         cross = tl.dot(x_tile, c_tile, input_precision="ieee")
-        dist = cent_sq[None, :] - 2.0 * cross
+        if SKIP_CSQ:
+            dist = -cross
+        else:
+            csq_ptrs = csq_base + k_offsets.to(tl.int64) * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+            dist = cent_sq[None, :] - 2.0 * cross
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
         _k_idx2 = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
         curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx2, dist.shape)),
